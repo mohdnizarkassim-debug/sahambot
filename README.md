@@ -112,3 +112,4 @@ Output:
 ## ⚠️ Disclaimer
 
 Analisa ini untuk tujuan pembelajaran sahaja. Bukan nasihat pelaburan rasmi.
+"# sahambot" 
