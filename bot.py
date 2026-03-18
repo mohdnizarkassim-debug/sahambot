@@ -775,7 +775,8 @@ async def cancel(update: Update, context: ContextTypes.DEFAULT_TYPE):
 # ─────────────────────────────────────────
 async def main():
     init_db()
-    TOKEN = "8447979205:AAFUn1yfI4dMP15ZTRSK4Aa-og45VdN5t0E"
+    import os
+    TOKEN = os.environ.get("BOT_TOKEN")
     app = Application.builder().token(TOKEN).build()
 
     conv_handler = ConversationHandler(
