@@ -3,7 +3,8 @@ Admin Tool — SahamBot MY
 Manage users + tengok pilot stats
 """
 import sys
-from database import init_db, set_tier, get_user, get_pilot_stats
+from database import init_db, set_tier, get_user, get_pilot_stats, ensure_daily_usage_current
+
 
 def main():
     init_db()
@@ -55,6 +56,7 @@ def main():
         set_tier(user_id, 0)
         print(f"⛔ User {user_id} → FREE")
     elif action == "check":
+        ensure_daily_usage_current(user_id)
         user = get_user(user_id)
         if user:
             tier_label = ["FREE", "PREMIUM", "PRO"][user[2]]
@@ -66,6 +68,7 @@ def main():
             print(f"❌ User {user_id} tidak dijumpai.")
     else:
         print("❗ Action tidak dikenali.")
+
 
 if __name__ == "__main__":
     main()

@@ -8,6 +8,7 @@ import csv
 import io
 import math
 import re
+import time
 from datetime import datetime
 from telegram import Update, InlineKeyboardButton, InlineKeyboardMarkup
 from telegram.helpers import escape_markdown
@@ -17,13 +18,19 @@ from telegram.ext import (
     filters, ContextTypes
 )
 
-from database import init_db, get_user, create_user, increment_usage, log_pilot
+from config import get_settings, setup_logging
+from database import (
+    init_db,
+    get_user,
+    create_user,
+    increment_usage,
+    log_pilot,
+    ensure_daily_usage_current,
+)
 from analisa import analisa_engine, CANDLE_INFO
 
-logging.basicConfig(
-    format='%(asctime)s - %(name)s - %(levelname)s - %(message)s',
-    level=logging.INFO
-)
+logger = logging.getLogger(__name__)
+SETTINGS = get_settings()
 
 (
     STATE_MAIN,
@@ -37,14 +44,18 @@ logging.basicConfig(
     STATE_SAVE,
 ) = range(9)
 
-MAX_CSV_SIZE_BYTES = 1024 * 1024
+MAX_CSV_SIZE_BYTES = SETTINGS.max_csv_size_bytes
 TICKER_PATTERN = re.compile(r"^[A-Z0-9][A-Z0-9._-]{1,11}$")
+ANALYSIS_COOLDOWNS = {}
+
 
 def md(text: str) -> str:
     return escape_markdown(str(text), version=1)
 
+
 def is_valid_ticker(ticker: str) -> bool:
     return bool(TICKER_PATTERN.fullmatch(ticker))
+
 
 def parse_candle_values(raw_values):
     if len(raw_values) != 5:
@@ -67,8 +78,50 @@ def parse_candle_values(raw_values):
         raise ValueError("logic")
     return o, h, l, c, v
 
+
+def get_cooldown_remaining(user_id: int) -> int:
+    cooldown_seconds = SETTINGS.analysis_cooldown_seconds
+    if cooldown_seconds <= 0:
+        return 0
+
+    last_run = ANALYSIS_COOLDOWNS.get(user_id, 0.0)
+    elapsed = time.monotonic() - last_run
+    if elapsed >= cooldown_seconds:
+        return 0
+    return max(1, int(cooldown_seconds - elapsed))
+
+
+def mark_analysis_started(user_id: int):
+    if SETTINGS.analysis_cooldown_seconds > 0:
+        ANALYSIS_COOLDOWNS[user_id] = time.monotonic()
+
+
+async def error_handler(update: object, context: ContextTypes.DEFAULT_TYPE):
+    error = context.error
+    if error:
+        logger.error(
+            "Unhandled exception while processing update",
+            exc_info=(type(error), error, error.__traceback__),
+        )
+    else:
+        logger.error("Unhandled exception while processing update without exception details")
+
+    try:
+        if isinstance(update, Update) and update.callback_query:
+            await update.callback_query.answer(
+                "⚠️ Maaf, ada masalah teknikal. Sila cuba lagi sekejap lagi.",
+                show_alert=True,
+            )
+        elif isinstance(update, Update) and update.effective_message:
+            await update.effective_message.reply_text(
+                "⚠️ Maaf, ada masalah teknikal. Sila cuba lagi sekejap lagi."
+            )
+    except Exception:
+        logger.exception("Failed to send generic error message to user")
+
+
 async def send_analysis_result(message, context, user_id: int, candles, ticker: str, tf: str, tier: int, count: int, input_method: str):
-    tf_label = {"D":"Daily","W":"Weekly","M":"Monthly","Y":"Yearly"}
+    tf_label = {"D": "Daily", "W": "Weekly", "M": "Monthly", "Y": "Yearly"}
     safe_ticker = md(ticker)
 
     await message.reply_text(
@@ -102,6 +155,7 @@ async def send_analysis_result(message, context, user_id: int, candles, ticker: 
 
     return sent_message
 
+
 # ─────────────────────────────────────────
 # KEYBOARDS
 # ─────────────────────────────────────────
@@ -113,10 +167,12 @@ def kb_main():
         [InlineKeyboardButton("📖 Panduan", callback_data="menu_help")],
     ])
 
+
 def kb_dashboard():
     return InlineKeyboardMarkup([
         [InlineKeyboardButton("🏠 Dashboard", callback_data="menu_main")],
     ])
+
 
 def kb_during_input():
     """Butang semasa input candle"""
@@ -124,6 +180,7 @@ def kb_during_input():
         [InlineKeyboardButton("🔄 Tukar Saham", callback_data="tukar_saham"),
          InlineKeyboardButton("🏠 Dashboard", callback_data="menu_main")],
     ])
+
 
 def kb_after_analisa():
     """Butang lepas analisa keluar"""
@@ -134,6 +191,7 @@ def kb_after_analisa():
          InlineKeyboardButton("🔄 Saham Lain", callback_data="saham_lain")],
         [InlineKeyboardButton("🏠 Dashboard", callback_data="menu_main")],
     ])
+
 
 # ─────────────────────────────────────────
 # DASHBOARD
@@ -146,6 +204,7 @@ async def show_dashboard(target, context, edit=False):
         user_id = target.effective_user.id
         name = md(target.effective_user.first_name)
 
+    ensure_daily_usage_current(user_id)
     user = get_user(user_id)
     tier = user[2] if user else 0
     usage = user[3] if user else 0
@@ -165,6 +224,7 @@ async def show_dashboard(target, context, edit=False):
     else:
         await target.message.reply_text(msg, reply_markup=kb_main(), parse_mode='Markdown')
 
+
 # ─────────────────────────────────────────
 # /start
 # ─────────────────────────────────────────
@@ -174,6 +234,7 @@ async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
     context.user_data.clear()
     await show_dashboard(update, context, edit=False)
     return STATE_MAIN
+
 
 # ─────────────────────────────────────────
 # MAIN MENU
@@ -203,7 +264,6 @@ async def handle_main_menu(update: Update, context: ContextTypes.DEFAULT_TYPE):
         context.user_data.clear()
         return await start_analisa(query, context)
     elif data == "tukar_saham":
-        # Reset data, balik taip saham — token TAK ditolak
         context.user_data['candles_collected'] = []
         context.user_data['current_candle'] = 1
         context.user_data['ticker'] = ''
@@ -219,11 +279,13 @@ async def handle_main_menu(update: Update, context: ContextTypes.DEFAULT_TYPE):
     elif data == "save_txt":
         return await handle_save_txt(query, context)
 
+
 # ─────────────────────────────────────────
 # STATUS
 # ─────────────────────────────────────────
 async def show_status(query, context):
     user_id = query.from_user.id
+    ensure_daily_usage_current(user_id)
     user = get_user(user_id)
     tier = user[2] if user else 0
     usage = user[3] if user else 0
@@ -241,6 +303,7 @@ async def show_status(query, context):
         reply_markup=keyboard, parse_mode='Markdown'
     )
     return STATE_MAIN
+
 
 # ─────────────────────────────────────────
 # UPGRADE
@@ -276,6 +339,7 @@ async def show_upgrade(query, context):
     await query.edit_message_text(msg, reply_markup=kb_dashboard(), parse_mode='Markdown')
     return STATE_MAIN
 
+
 # ─────────────────────────────────────────
 # HELP
 # ─────────────────────────────────────────
@@ -305,11 +369,13 @@ async def show_help(query, context):
     await query.edit_message_text(msg, reply_markup=kb_dashboard(), parse_mode='Markdown')
     return STATE_MAIN
 
+
 # ─────────────────────────────────────────
 # ANALISA — Step 1: Tanya Nama Saham
 # ─────────────────────────────────────────
 async def start_analisa(query, context, ticker=''):
     user_id = query.from_user.id
+    ensure_daily_usage_current(user_id)
     user = get_user(user_id)
     tier = user[2] if user else 0
     usage = user[3] if user else 0
@@ -337,6 +403,7 @@ async def start_analisa(query, context, ticker=''):
         parse_mode='Markdown'
     )
     return STATE_TICKER
+
 
 # ─────────────────────────────────────────
 # ANALISA — Step 2: Terima Ticker
@@ -373,6 +440,7 @@ async def handle_ticker_input(update: Update, context: ContextTypes.DEFAULT_TYPE
     )
     return STATE_TIMEFRAME
 
+
 # ─────────────────────────────────────────
 # Show Timeframe
 # ─────────────────────────────────────────
@@ -399,6 +467,7 @@ async def show_timeframe(query, context):
     )
     return STATE_TIMEFRAME
 
+
 # ─────────────────────────────────────────
 # ANALISA — Step 3: Pilih Candle
 # ─────────────────────────────────────────
@@ -410,26 +479,27 @@ async def handle_timeframe(update: Update, context: ContextTypes.DEFAULT_TYPE):
     context.user_data['timeframe'] = tf
     tier = context.user_data.get('tier', 0)
     ticker = context.user_data.get('ticker', 'SAHAM')
-    tf_label = {"D":"Daily","W":"Weekly","M":"Monthly","Y":"Yearly","MTF":"Multi-Timeframe"}
+    tf_label = {"D": "Daily", "W": "Weekly", "M": "Monthly", "Y": "Yearly", "MTF": "Multi-Timeframe"}
 
     if tier == 0:
         context.user_data['candle_count'] = 5
         return await show_candle_warning(query, context, 5)
 
     await query.edit_message_text(
-        f"✅ *{md(ticker)}* | *{md(tf_label.get(tf,tf))}*\n\nPilih *Bilangan Candle*:\n_(5 = minimum, 10 = paling tepat)_",
+        f"✅ *{md(ticker)}* | *{md(tf_label.get(tf, tf))}*\n\nPilih *Bilangan Candle*:\n_(5 = minimum, 10 = paling tepat)_",
         reply_markup=InlineKeyboardMarkup([
-            [InlineKeyboardButton("5",callback_data="c_5"),
-             InlineKeyboardButton("6",callback_data="c_6"),
-             InlineKeyboardButton("7",callback_data="c_7")],
-            [InlineKeyboardButton("8",callback_data="c_8"),
-             InlineKeyboardButton("9",callback_data="c_9"),
-             InlineKeyboardButton("10",callback_data="c_10")],
-            [InlineKeyboardButton("🔄 Tukar Saham",callback_data="tukar_saham"),
-             InlineKeyboardButton("🏠 Dashboard",callback_data="menu_main")],
+            [InlineKeyboardButton("5", callback_data="c_5"),
+             InlineKeyboardButton("6", callback_data="c_6"),
+             InlineKeyboardButton("7", callback_data="c_7")],
+            [InlineKeyboardButton("8", callback_data="c_8"),
+             InlineKeyboardButton("9", callback_data="c_9"),
+             InlineKeyboardButton("10", callback_data="c_10")],
+            [InlineKeyboardButton("🔄 Tukar Saham", callback_data="tukar_saham"),
+             InlineKeyboardButton("🏠 Dashboard", callback_data="menu_main")],
         ]), parse_mode='Markdown'
     )
     return STATE_CANDLE_COUNT
+
 
 # ─────────────────────────────────────────
 # ANALISA — Step 4: Candle Warning
@@ -437,32 +507,34 @@ async def handle_timeframe(update: Update, context: ContextTypes.DEFAULT_TYPE):
 async def handle_candle_count(update: Update, context: ContextTypes.DEFAULT_TYPE):
     query = update.callback_query
     await query.answer()
-    count = int(query.data.replace("c_",""))
+    count = int(query.data.replace("c_", ""))
     context.user_data['candle_count'] = count
     return await show_candle_warning(query, context, count)
 
+
 async def show_candle_warning(query, context, count: int):
     info = CANDLE_INFO[count]
-    ticker = context.user_data.get('ticker','SAHAM')
-    tf = context.user_data.get('timeframe','D')
-    tf_label = {"D":"Daily","W":"Weekly","M":"Monthly","Y":"Yearly"}
+    ticker = context.user_data.get('ticker', 'SAHAM')
+    tf = context.user_data.get('timeframe', 'D')
+    tf_label = {"D": "Daily", "W": "Weekly", "M": "Monthly", "Y": "Yearly"}
     available = "\n".join([f"  ✅ {i}" for i in info['available']])
     limited = "\n".join([f"  ⚠️ {i}" for i in info['limited']]) if info['limited'] else "  —"
     unavailable = "\n".join([f"  ❌ {i}" for i in info['unavailable']]) if info['unavailable'] else "  —"
     await query.edit_message_text(
-        f"✅ *{md(ticker)}* | {md(tf_label.get(tf,tf))} | {count} Candle\n\n"
+        f"✅ *{md(ticker)}* | {md(tf_label.get(tf, tf))} | {count} Candle\n\n"
         f"*Indicator Tersedia:*\n{available}\n\n"
         f"*Kurang Tepat:*\n{limited}\n\n"
         f"*Tidak Tersedia:*\n{unavailable}\n\n"
         f"💡 {info['suitable']}\n\nTeruskan dengan *{count} candle*?",
         reply_markup=InlineKeyboardMarkup([
-            [InlineKeyboardButton("✅ Teruskan",callback_data="confirm_yes"),
-             InlineKeyboardButton("🔄 Tukar",callback_data="confirm_change")],
-            [InlineKeyboardButton("🔄 Tukar Saham",callback_data="tukar_saham"),
-             InlineKeyboardButton("🏠 Dashboard",callback_data="menu_main")],
+            [InlineKeyboardButton("✅ Teruskan", callback_data="confirm_yes"),
+             InlineKeyboardButton("🔄 Tukar", callback_data="confirm_change")],
+            [InlineKeyboardButton("🔄 Tukar Saham", callback_data="tukar_saham"),
+             InlineKeyboardButton("🏠 Dashboard", callback_data="menu_main")],
         ]), parse_mode='Markdown'
     )
     return STATE_CANDLE_CONFIRM
+
 
 # ─────────────────────────────────────────
 # ANALISA — Step 5: Confirm
@@ -475,23 +547,23 @@ async def handle_candle_confirm(update: Update, context: ContextTypes.DEFAULT_TY
         await query.edit_message_text(
             "🔄 *Pilih semula bilangan candle:*",
             reply_markup=InlineKeyboardMarkup([
-                [InlineKeyboardButton("5",callback_data="c_5"),
-                 InlineKeyboardButton("6",callback_data="c_6"),
-                 InlineKeyboardButton("7",callback_data="c_7")],
-                [InlineKeyboardButton("8",callback_data="c_8"),
-                 InlineKeyboardButton("9",callback_data="c_9"),
-                 InlineKeyboardButton("10",callback_data="c_10")],
-                [InlineKeyboardButton("🔄 Tukar Saham",callback_data="tukar_saham"),
-                 InlineKeyboardButton("🏠 Dashboard",callback_data="menu_main")],
+                [InlineKeyboardButton("5", callback_data="c_5"),
+                 InlineKeyboardButton("6", callback_data="c_6"),
+                 InlineKeyboardButton("7", callback_data="c_7")],
+                [InlineKeyboardButton("8", callback_data="c_8"),
+                 InlineKeyboardButton("9", callback_data="c_9"),
+                 InlineKeyboardButton("10", callback_data="c_10")],
+                [InlineKeyboardButton("🔄 Tukar Saham", callback_data="tukar_saham"),
+                 InlineKeyboardButton("🏠 Dashboard", callback_data="menu_main")],
             ]), parse_mode='Markdown'
         )
         return STATE_CANDLE_COUNT
 
     tier = context.user_data.get('tier', 0)
-    ticker = context.user_data.get('ticker','SAHAM')
-    tf = context.user_data.get('timeframe','D')
+    ticker = context.user_data.get('ticker', 'SAHAM')
+    tf = context.user_data.get('timeframe', 'D')
     count = context.user_data.get('candle_count', 5)
-    tf_label = {"D":"Daily","W":"Weekly","M":"Monthly","Y":"Yearly"}
+    tf_label = {"D": "Daily", "W": "Weekly", "M": "Monthly", "Y": "Yearly"}
 
     context.user_data['candles_collected'] = []
     context.user_data['current_candle'] = 1
@@ -499,7 +571,7 @@ async def handle_candle_confirm(update: Update, context: ContextTypes.DEFAULT_TY
 
     if tier == 0:
         await query.edit_message_text(
-            f"⌨️ *Input Data — {md(ticker)} {md(tf_label.get(tf,tf))}*\n\n"
+            f"⌨️ *Input Data — {md(ticker)} {md(tf_label.get(tf, tf))}*\n\n"
             f"📊 *Candle 1/{count}*\n\n"
             "`OPEN HIGH LOW CLOSE VOLUME`\n\n"
             "📌 Contoh: `9.10 9.45 9.05 9.20 980000`\n\n"
@@ -509,15 +581,16 @@ async def handle_candle_confirm(update: Update, context: ContextTypes.DEFAULT_TY
         return STATE_GUIDED_CANDLE
 
     await query.edit_message_text(
-        f"✅ *{md(ticker)}* | {md(tf_label.get(tf,tf))} | {count} Candle\n\nPilih *Cara Input:*",
+        f"✅ *{md(ticker)}* | {md(tf_label.get(tf, tf))} | {count} Candle\n\nPilih *Cara Input:*",
         reply_markup=InlineKeyboardMarkup([
-            [InlineKeyboardButton("⌨️ Input Guided",callback_data="input_manual")],
-            [InlineKeyboardButton("📎 Upload CSV",callback_data="input_csv")],
-            [InlineKeyboardButton("🔄 Tukar Saham",callback_data="tukar_saham"),
-             InlineKeyboardButton("🏠 Dashboard",callback_data="menu_main")],
+            [InlineKeyboardButton("⌨️ Input Guided", callback_data="input_manual")],
+            [InlineKeyboardButton("📎 Upload CSV", callback_data="input_csv")],
+            [InlineKeyboardButton("🔄 Tukar Saham", callback_data="tukar_saham"),
+             InlineKeyboardButton("🏠 Dashboard", callback_data="menu_main")],
         ]), parse_mode='Markdown'
     )
     return STATE_INPUT_METHOD
+
 
 # ─────────────────────────────────────────
 # Input Method
@@ -525,18 +598,18 @@ async def handle_candle_confirm(update: Update, context: ContextTypes.DEFAULT_TY
 async def handle_input_method(update: Update, context: ContextTypes.DEFAULT_TYPE):
     query = update.callback_query
     await query.answer()
-    method = query.data.replace("input_","")
+    method = query.data.replace("input_", "")
     context.user_data['input_method'] = method
-    ticker = context.user_data.get('ticker','SAHAM')
-    tf = context.user_data.get('timeframe','D')
+    ticker = context.user_data.get('ticker', 'SAHAM')
+    tf = context.user_data.get('timeframe', 'D')
     count = context.user_data.get('candle_count', 5)
-    tf_label = {"D":"Daily","W":"Weekly","M":"Monthly","Y":"Yearly"}
+    tf_label = {"D": "Daily", "W": "Weekly", "M": "Monthly", "Y": "Yearly"}
 
     if method == 'manual':
         context.user_data['candles_collected'] = []
         context.user_data['current_candle'] = 1
         await query.edit_message_text(
-            f"⌨️ *Input Data — {md(ticker)} {md(tf_label.get(tf,tf))}*\n\n"
+            f"⌨️ *Input Data — {md(ticker)} {md(tf_label.get(tf, tf))}*\n\n"
             f"📊 *Candle 1/{count}*\n\n"
             "`OPEN HIGH LOW CLOSE VOLUME`\n\n"
             "📌 Contoh: `9.10 9.45 9.05 9.20 980000`\n\n"
@@ -555,6 +628,7 @@ async def handle_input_method(update: Update, context: ContextTypes.DEFAULT_TYPE
             parse_mode='Markdown'
         )
         return STATE_WAITING_CSV
+
 
 # ─────────────────────────────────────────
 # GUIDED CANDLE
@@ -576,8 +650,8 @@ async def handle_guided_candle(update: Update, context: ContextTypes.DEFAULT_TYP
                 "❗ *Data tak logik!*\n\nHIGH kena > OPEN & CLOSE\nLOW kena < OPEN & CLOSE\n\n"
                 f"Cuba semula *Candle {current}/{count}*:",
                 reply_markup=InlineKeyboardMarkup([
-                    [InlineKeyboardButton("🔄 Tukar Saham",callback_data="tukar_saham"),
-                     InlineKeyboardButton("🏠 Dashboard",callback_data="menu_main")]
+                    [InlineKeyboardButton("🔄 Tukar Saham", callback_data="tukar_saham"),
+                     InlineKeyboardButton("🏠 Dashboard", callback_data="menu_main")]
                 ]),
                 parse_mode='Markdown'
             )
@@ -588,8 +662,8 @@ async def handle_guided_candle(update: Update, context: ContextTypes.DEFAULT_TYP
                 "❗ *Data tak valid!*\n\nSemua harga mesti lebih besar dari 0 dan volume tak boleh negatif.\n\n"
                 f"Cuba semula *Candle {current}/{count}*:",
                 reply_markup=InlineKeyboardMarkup([
-                    [InlineKeyboardButton("🔄 Tukar Saham",callback_data="tukar_saham"),
-                     InlineKeyboardButton("🏠 Dashboard",callback_data="menu_main")]
+                    [InlineKeyboardButton("🔄 Tukar Saham", callback_data="tukar_saham"),
+                     InlineKeyboardButton("🏠 Dashboard", callback_data="menu_main")]
                 ]),
                 parse_mode='Markdown'
             )
@@ -600,15 +674,15 @@ async def handle_guided_candle(update: Update, context: ContextTypes.DEFAULT_TYP
             "Contoh: `9.10 9.45 9.05 9.20 980000`\n\n"
             f"Cuba semula *Candle {current}/{count}*:",
             reply_markup=InlineKeyboardMarkup([
-                [InlineKeyboardButton("🔄 Tukar Saham",callback_data="tukar_saham"),
-                 InlineKeyboardButton("🏠 Dashboard",callback_data="menu_main")]
+                [InlineKeyboardButton("🔄 Tukar Saham", callback_data="tukar_saham"),
+                 InlineKeyboardButton("🏠 Dashboard", callback_data="menu_main")]
             ]),
             parse_mode='Markdown'
         )
         return STATE_GUIDED_CANDLE
 
     candles = context.user_data.get('candles_collected', [])
-    candles.append((o,h,l,c,v))
+    candles.append((o, h, l, c, v))
     context.user_data['candles_collected'] = candles
 
     filled = "🟩" * current
@@ -616,6 +690,14 @@ async def handle_guided_candle(update: Update, context: ContextTypes.DEFAULT_TYP
     progress = f"{filled}{empty}  {current}/{count}"
 
     if current >= count:
+        cooldown_remaining = get_cooldown_remaining(user_id)
+        if cooldown_remaining > 0:
+            await update.message.reply_text(
+                f"⏳ Sabar sikit — cuba lagi dalam {cooldown_remaining} saat."
+            )
+            return STATE_GUIDED_CANDLE
+
+        mark_analysis_started(user_id)
         await send_analysis_result(
             update.message,
             context,
@@ -637,12 +719,13 @@ async def handle_guided_candle(update: Update, context: ContextTypes.DEFAULT_TYP
             "`OPEN HIGH LOW CLOSE VOLUME`\n\n"
             "💡 _Token hanya ditolak selepas analisa keluar_",
             reply_markup=InlineKeyboardMarkup([
-                [InlineKeyboardButton("🔄 Tukar Saham",callback_data="tukar_saham"),
-                 InlineKeyboardButton("🏠 Dashboard",callback_data="menu_main")]
+                [InlineKeyboardButton("🔄 Tukar Saham", callback_data="tukar_saham"),
+                 InlineKeyboardButton("🏠 Dashboard", callback_data="menu_main")]
             ]),
             parse_mode='Markdown'
         )
         return STATE_GUIDED_CANDLE
+
 
 # ─────────────────────────────────────────
 # CSV Upload
@@ -673,12 +756,12 @@ async def handle_csv_upload(update: Update, context: ContextTypes.DEFAULT_TYPE):
         reader = csv.DictReader(io.StringIO(content))
         headers = [h.lower().strip() for h in (reader.fieldnames or [])]
         col_map = {}
-        for col in ['open','high','low','close','volume']:
+        for col in ['open', 'high', 'low', 'close', 'volume']:
             for h in headers:
                 if col in h:
                     col_map[col] = h
                     break
-        missing = [c for c in ['open','high','low','close','volume'] if c not in col_map]
+        missing = [c for c in ['open', 'high', 'low', 'close', 'volume'] if c not in col_map]
         if missing:
             await update.message.reply_text(
                 f"❗ Kolum tidak jumpa: *{', '.join(missing)}*", parse_mode='Markdown'
@@ -700,7 +783,7 @@ async def handle_csv_upload(update: Update, context: ContextTypes.DEFAULT_TYPE):
                 row[col_map['close']],
                 row[col_map['volume']],
             ])
-            candles.append((o,h,l,c,v))
+            candles.append((o, h, l, c, v))
     except Exception:
         logging.exception("CSV validation failed for user %s", user_id)
         await update.message.reply_text(
@@ -708,6 +791,14 @@ async def handle_csv_upload(update: Update, context: ContextTypes.DEFAULT_TYPE):
         )
         return STATE_WAITING_CSV
 
+    cooldown_remaining = get_cooldown_remaining(user_id)
+    if cooldown_remaining > 0:
+        await update.message.reply_text(
+            f"⏳ Sabar sikit — cuba lagi dalam {cooldown_remaining} saat."
+        )
+        return STATE_WAITING_CSV
+
+    mark_analysis_started(user_id)
     await send_analysis_result(
         update.message,
         context,
@@ -720,6 +811,7 @@ async def handle_csv_upload(update: Update, context: ContextTypes.DEFAULT_TYPE):
         'csv',
     )
     return STATE_SAVE
+
 
 # ─────────────────────────────────────────
 # SAVE FEATURES
@@ -748,7 +840,6 @@ async def handle_save_forward(update: Update, context: ContextTypes.DEFAULT_TYPE
     )
 
     try:
-        # Forward ke Saved Messages (chat_id = user_id)
         await query.bot.send_message(
             chat_id=query.from_user.id,
             text=save_msg,
@@ -760,6 +851,7 @@ async def handle_save_forward(update: Update, context: ContextTypes.DEFAULT_TYPE
         await query.answer("❗ Gagal forward. Cuba download .txt.", show_alert=True)
 
     return STATE_SAVE
+
 
 async def handle_save_txt(update: Update, context: ContextTypes.DEFAULT_TYPE):
     """Hantar analisa sebagai file .txt"""
@@ -775,16 +867,15 @@ async def handle_save_txt(update: Update, context: ContextTypes.DEFAULT_TYPE):
         await query.answer("❗ Tiada data analisa.", show_alert=True)
         return STATE_SAVE
 
-    # Bersihkan markdown untuk txt
-    clean_result = result.replace('*','').replace('`','').replace('_','')
+    clean_result = result.replace('*', '').replace('`', '').replace('_', '')
 
     txt_content = (
         f"ANALISA SAHAM — {ticker}\n"
         f"Timeframe: {tf} | {count} Candle\n"
         f"Masa: {timestamp}\n"
-        f"{'='*40}\n\n"
+        f"{'=' * 40}\n\n"
         f"{clean_result}\n\n"
-        f"{'='*40}\n"
+        f"{'=' * 40}\n"
         f"Dijana oleh SahamBot MY\n"
         f"⚠️ Untuk tujuan pembelajaran sahaja. Bukan nasihat pelaburan.\n"
     )
@@ -808,6 +899,7 @@ async def handle_save_txt(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
     return STATE_SAVE
 
+
 # ─────────────────────────────────────────
 # Cancel
 # ─────────────────────────────────────────
@@ -818,14 +910,18 @@ async def cancel(update: Update, context: ContextTypes.DEFAULT_TYPE):
     await show_dashboard(update, context, edit=False)
     return STATE_MAIN
 
+
 # ─────────────────────────────────────────
 # Main
 # ─────────────────────────────────────────
 async def main():
+    setup_logging(SETTINGS)
+    SETTINGS.validate(require_bot_token=True)
+    logger.info("Starting SahamBot")
+
     init_db()
-    import os
-    TOKEN = os.environ.get("BOT_TOKEN")
-    app = Application.builder().token(TOKEN).build()
+    app = Application.builder().token(SETTINGS.bot_token).build()
+    app.add_error_handler(error_handler)
 
     conv_handler = ConversationHandler(
         entry_points=[CommandHandler("start", start)],
@@ -868,20 +964,36 @@ async def main():
     )
 
     app.add_handler(conv_handler)
-    print("✅ SahamBot MY v2.2 running...")
-    await app.initialize()
-    await app.start()
-    await app.updater.start_polling()
-    print("🟢 Bot hidup! Tekan Ctrl+C untuk stop.")
+
+    initialized = False
+    started = False
+    polling = False
+
     import asyncio
     try:
+        await app.initialize()
+        initialized = True
+        await app.start()
+        started = True
+        await app.updater.start_polling()
+        polling = True
+        logger.info("SahamBot started successfully and polling is active")
         await asyncio.Event().wait()
     except (KeyboardInterrupt, SystemExit):
-        pass
+        logger.info("Shutdown signal received")
+    except Exception:
+        logger.exception("SahamBot stopped due to an unexpected startup/runtime error")
+        raise
     finally:
-        await app.updater.stop()
-        await app.stop()
-        await app.shutdown()
+        logger.info("Shutting down SahamBot")
+        if polling:
+            await app.updater.stop()
+        if started:
+            await app.stop()
+        if initialized:
+            await app.shutdown()
+        logger.info("SahamBot shutdown complete")
+
 
 if __name__ == "__main__":
     import asyncio
