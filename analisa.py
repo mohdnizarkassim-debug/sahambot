@@ -4,6 +4,7 @@ Adaptive: 5–10 candle, multi-timeframe
 """
 
 import math
+from telegram.helpers import escape_markdown
 
 # ─────────────────────────────────────────
 # CANDLE COUNT INFO — Kesan setiap pilihan
@@ -228,11 +229,23 @@ def detect_engulfing(candles: list) -> str:
         return ""
     prev = candles[-2]
     curr = candles[-1]
-    prev_body = abs(curr[3] - curr[0])
-    curr_body = abs(prev[3] - prev[0])
-    if curr[3] > curr[0] and prev[3] < prev[0] and curr_body > prev_body:
+    prev_body = abs(prev[3] - prev[0])
+    curr_body = abs(curr[3] - curr[0])
+    if (
+        curr[3] > curr[0]
+        and prev[3] < prev[0]
+        and curr_body > prev_body
+        and curr[0] <= prev[3]
+        and curr[3] >= prev[0]
+    ):
         return "🟢 Bullish Engulfing — signal reversal kuat"
-    if curr[3] < curr[0] and prev[3] > prev[0] and curr_body > prev_body:
+    if (
+        curr[3] < curr[0]
+        and prev[3] > prev[0]
+        and curr_body > prev_body
+        and curr[0] >= prev[3]
+        and curr[3] <= prev[0]
+    ):
         return "🔴 Bearish Engulfing — signal reversal kuat"
     return ""
 
@@ -286,6 +299,8 @@ def analisa_engine(candles: list, ticker: str, timeframe: str, tier: int) -> str
     vols   = [c[4] for c in candles]
     n      = len(candles)
 
+    safe_ticker = escape_markdown(str(ticker), version=1)
+
     tf_label = {"D": "Daily", "W": "Weekly", "M": "Monthly", "Y": "Yearly"}
     last_open  = opens[-1]
     last_close = closes[-1]
@@ -306,7 +321,7 @@ def analisa_engine(candles: list, ticker: str, timeframe: str, tier: int) -> str
     # Header
     tier_label = "💎 PREMIUM" if tier == 1 else ("👑 PRO" if tier == 2 else "⚡ FREE")
     msg = (
-        f"{tier_label} *Analisa: {ticker}*\n"
+        f"{tier_label} *Analisa: {safe_ticker}*\n"
         f"📅 {tf_label.get(timeframe, timeframe)} | {n} Candle\n"
         f"━━━━━━━━━━━━━━━━━━\n"
         f"💹 *Candle Terkini*\n"
