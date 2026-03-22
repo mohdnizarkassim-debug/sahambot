@@ -6,8 +6,11 @@ Pilot Project v2.2 — Privacy + Save Feature
 import logging
 import csv
 import io
+import math
+import re
 from datetime import datetime
 from telegram import Update, InlineKeyboardButton, InlineKeyboardMarkup
+from telegram.helpers import escape_markdown
 from telegram.ext import (
     Application, CommandHandler, MessageHandler,
     CallbackQueryHandler, ConversationHandler,
@@ -33,6 +36,71 @@ logging.basicConfig(
     STATE_WAITING_CSV,
     STATE_SAVE,
 ) = range(9)
+
+MAX_CSV_SIZE_BYTES = 1024 * 1024
+TICKER_PATTERN = re.compile(r"^[A-Z0-9][A-Z0-9._-]{1,11}$")
+
+def md(text: str) -> str:
+    return escape_markdown(str(text), version=1)
+
+def is_valid_ticker(ticker: str) -> bool:
+    return bool(TICKER_PATTERN.fullmatch(ticker))
+
+def parse_candle_values(raw_values):
+    if len(raw_values) != 5:
+        raise ValueError("format")
+
+    values = []
+    for raw in raw_values:
+        cleaned = str(raw).replace(',', '').strip()
+        if not cleaned:
+            raise ValueError("format")
+        value = float(cleaned)
+        if not math.isfinite(value):
+            raise ValueError("format")
+        values.append(value)
+
+    o, h, l, c, v = values
+    if min(o, h, l, c) <= 0 or v < 0:
+        raise ValueError("range")
+    if h < max(o, c) or l > min(o, c) or h < l:
+        raise ValueError("logic")
+    return o, h, l, c, v
+
+async def send_analysis_result(message, context, user_id: int, candles, ticker: str, tf: str, tier: int, count: int, input_method: str):
+    tf_label = {"D":"Daily","W":"Weekly","M":"Monthly","Y":"Yearly"}
+    safe_ticker = md(ticker)
+
+    await message.reply_text(
+        f"✅ *Semua {count} candle diterima!*\n\n⏳ Menganalisa *{safe_ticker}*...",
+        parse_mode='Markdown'
+    )
+
+    result = analisa_engine(candles, ticker, tf, tier)
+    timestamp = datetime.now().strftime("%d/%m/%Y %H:%M")
+    sent_message = await message.reply_text(
+        f"{result}\n\n"
+        "━━━━━━━━━━━━━━━━\n"
+        "⚠️ *NOTIS PENTING*\n"
+        f"• 1 token telah ditolak\n"
+        f"• Data analisa *TIDAK* tersimpan dalam sistem\n"
+        f"• Sila simpan analisa ini sekarang\n"
+        f"• Masa: {md(timestamp)}",
+        reply_markup=kb_after_analisa(),
+        parse_mode='Markdown'
+    )
+
+    increment_usage(user_id)
+    log_pilot(user_id, tf, count, input_method, tier)
+
+    context.user_data['last_result'] = result
+    context.user_data['last_ticker'] = ticker
+    context.user_data['last_tf'] = tf_label.get(tf, tf)
+    context.user_data['last_count'] = count
+    context.user_data['candles_collected'] = []
+    context.user_data['current_candle'] = 1
+
+    return sent_message
 
 # ─────────────────────────────────────────
 # KEYBOARDS
@@ -73,10 +141,10 @@ def kb_after_analisa():
 async def show_dashboard(target, context, edit=False):
     if hasattr(target, 'from_user'):
         user_id = target.from_user.id
-        name = target.from_user.first_name
+        name = md(target.from_user.first_name)
     else:
         user_id = target.effective_user.id
-        name = target.effective_user.first_name
+        name = md(target.effective_user.first_name)
 
     user = get_user(user_id)
     tier = user[2] if user else 0
@@ -276,7 +344,7 @@ async def start_analisa(query, context, ticker=''):
 async def handle_ticker_input(update: Update, context: ContextTypes.DEFAULT_TYPE):
     ticker = update.message.text.strip().upper()
 
-    if len(ticker) < 2 or len(ticker) > 12:
+    if len(ticker) < 2 or len(ticker) > 12 or not is_valid_ticker(ticker):
         await update.message.reply_text(
             "❗ Kod saham tak valid.\nContoh: `MAYBANK`, `TENAGA`",
             parse_mode='Markdown'
@@ -300,7 +368,7 @@ async def handle_ticker_input(update: Update, context: ContextTypes.DEFAULT_TYPE
              "\n🔒 Yearly & MTF — Pro sahaja" if tier == 1 else ""
 
     await update.message.reply_text(
-        f"✅ Saham: *{ticker}*\n\nPilih *Timeframe*:{locked}",
+        f"✅ Saham: *{md(ticker)}*\n\nPilih *Timeframe*:{locked}",
         reply_markup=InlineKeyboardMarkup(rows), parse_mode='Markdown'
     )
     return STATE_TIMEFRAME
@@ -326,7 +394,7 @@ async def show_timeframe(query, context):
              "\n🔒 Yearly & MTF — Pro sahaja" if tier == 1 else ""
 
     await query.edit_message_text(
-        f"✅ Saham: *{ticker}*\n\nPilih *Timeframe*:{locked}",
+        f"✅ Saham: *{md(ticker)}*\n\nPilih *Timeframe*:{locked}",
         reply_markup=InlineKeyboardMarkup(rows), parse_mode='Markdown'
     )
     return STATE_TIMEFRAME
@@ -349,7 +417,7 @@ async def handle_timeframe(update: Update, context: ContextTypes.DEFAULT_TYPE):
         return await show_candle_warning(query, context, 5)
 
     await query.edit_message_text(
-        f"✅ *{ticker}* | *{tf_label.get(tf,tf)}*\n\nPilih *Bilangan Candle*:\n_(5 = minimum, 10 = paling tepat)_",
+        f"✅ *{md(ticker)}* | *{md(tf_label.get(tf,tf))}*\n\nPilih *Bilangan Candle*:\n_(5 = minimum, 10 = paling tepat)_",
         reply_markup=InlineKeyboardMarkup([
             [InlineKeyboardButton("5",callback_data="c_5"),
              InlineKeyboardButton("6",callback_data="c_6"),
@@ -382,7 +450,7 @@ async def show_candle_warning(query, context, count: int):
     limited = "\n".join([f"  ⚠️ {i}" for i in info['limited']]) if info['limited'] else "  —"
     unavailable = "\n".join([f"  ❌ {i}" for i in info['unavailable']]) if info['unavailable'] else "  —"
     await query.edit_message_text(
-        f"✅ *{ticker}* | {tf_label.get(tf,tf)} | {count} Candle\n\n"
+        f"✅ *{md(ticker)}* | {md(tf_label.get(tf,tf))} | {count} Candle\n\n"
         f"*Indicator Tersedia:*\n{available}\n\n"
         f"*Kurang Tepat:*\n{limited}\n\n"
         f"*Tidak Tersedia:*\n{unavailable}\n\n"
@@ -431,7 +499,7 @@ async def handle_candle_confirm(update: Update, context: ContextTypes.DEFAULT_TY
 
     if tier == 0:
         await query.edit_message_text(
-            f"⌨️ *Input Data — {ticker} {tf_label.get(tf,tf)}*\n\n"
+            f"⌨️ *Input Data — {md(ticker)} {md(tf_label.get(tf,tf))}*\n\n"
             f"📊 *Candle 1/{count}*\n\n"
             "`OPEN HIGH LOW CLOSE VOLUME`\n\n"
             "📌 Contoh: `9.10 9.45 9.05 9.20 980000`\n\n"
@@ -441,7 +509,7 @@ async def handle_candle_confirm(update: Update, context: ContextTypes.DEFAULT_TY
         return STATE_GUIDED_CANDLE
 
     await query.edit_message_text(
-        f"✅ *{ticker}* | {tf_label.get(tf,tf)} | {count} Candle\n\nPilih *Cara Input:*",
+        f"✅ *{md(ticker)}* | {md(tf_label.get(tf,tf))} | {count} Candle\n\nPilih *Cara Input:*",
         reply_markup=InlineKeyboardMarkup([
             [InlineKeyboardButton("⌨️ Input Guided",callback_data="input_manual")],
             [InlineKeyboardButton("📎 Upload CSV",callback_data="input_csv")],
@@ -468,7 +536,7 @@ async def handle_input_method(update: Update, context: ContextTypes.DEFAULT_TYPE
         context.user_data['candles_collected'] = []
         context.user_data['current_candle'] = 1
         await query.edit_message_text(
-            f"⌨️ *Input Data — {ticker} {tf_label.get(tf,tf)}*\n\n"
+            f"⌨️ *Input Data — {md(ticker)} {md(tf_label.get(tf,tf))}*\n\n"
             f"📊 *Candle 1/{count}*\n\n"
             "`OPEN HIGH LOW CLOSE VOLUME`\n\n"
             "📌 Contoh: `9.10 9.45 9.05 9.20 980000`\n\n"
@@ -478,7 +546,7 @@ async def handle_input_method(update: Update, context: ContextTypes.DEFAULT_TYPE
         return STATE_GUIDED_CANDLE
     else:
         await query.edit_message_text(
-            f"📎 *Upload CSV — {ticker}*\n\n"
+            f"📎 *Upload CSV — {md(ticker)}*\n\n"
             "Hantar file CSV sekarang.\n\n"
             "✅ Kolum: `open, high, low, close, volume`\n"
             "• TradingView / Yahoo Finance export OK\n\n"
@@ -496,17 +564,14 @@ async def handle_guided_candle(update: Update, context: ContextTypes.DEFAULT_TYP
     text = update.message.text.strip()
     count = context.user_data.get('candle_count', 5)
     current = context.user_data.get('current_candle', 1)
-    ticker = context.user_data.get('ticker','SAHAM')
-    tf = context.user_data.get('timeframe','D')
+    ticker = context.user_data.get('ticker', 'SAHAM')
+    tf = context.user_data.get('timeframe', 'D')
     tier = context.user_data.get('tier', 0)
-    tf_label = {"D":"Daily","W":"Weekly","M":"Monthly","Y":"Yearly"}
 
     try:
-        parts = text.split()
-        if len(parts) != 5:
-            raise ValueError()
-        o,h,l,c,v = float(parts[0]),float(parts[1]),float(parts[2]),float(parts[3]),float(parts[4])
-        if h < max(o,c) or l > min(o,c):
+        o, h, l, c, v = parse_candle_values(text.split())
+    except ValueError as exc:
+        if str(exc) == "logic":
             await update.message.reply_text(
                 "❗ *Data tak logik!*\n\nHIGH kena > OPEN & CLOSE\nLOW kena < OPEN & CLOSE\n\n"
                 f"Cuba semula *Candle {current}/{count}*:",
@@ -517,7 +582,19 @@ async def handle_guided_candle(update: Update, context: ContextTypes.DEFAULT_TYP
                 parse_mode='Markdown'
             )
             return STATE_GUIDED_CANDLE
-    except ValueError:
+
+        if str(exc) == "range":
+            await update.message.reply_text(
+                "❗ *Data tak valid!*\n\nSemua harga mesti lebih besar dari 0 dan volume tak boleh negatif.\n\n"
+                f"Cuba semula *Candle {current}/{count}*:",
+                reply_markup=InlineKeyboardMarkup([
+                    [InlineKeyboardButton("🔄 Tukar Saham",callback_data="tukar_saham"),
+                     InlineKeyboardButton("🏠 Dashboard",callback_data="menu_main")]
+                ]),
+                parse_mode='Markdown'
+            )
+            return STATE_GUIDED_CANDLE
+
         await update.message.reply_text(
             "❗ *Format salah!*\n\n`OPEN HIGH LOW CLOSE VOLUME`\n"
             "Contoh: `9.10 9.45 9.05 9.20 980000`\n\n"
@@ -539,42 +616,17 @@ async def handle_guided_candle(update: Update, context: ContextTypes.DEFAULT_TYP
     progress = f"{filled}{empty}  {current}/{count}"
 
     if current >= count:
-        # Semua candle complete — proses analisa
-        await update.message.reply_text(
-            f"✅ *Semua {count} candle diterima!*\n{progress}\n\n"
-            f"⏳ Menganalisa *{ticker}*...",
-            parse_mode='Markdown'
+        await send_analysis_result(
+            update.message,
+            context,
+            user_id,
+            candles,
+            ticker,
+            tf,
+            tier,
+            count,
+            'manual',
         )
-
-        # BARU tolak token sekarang
-        increment_usage(user_id)
-        log_pilot(user_id, tf, count, 'manual', tier)
-        result = analisa_engine(candles, ticker, tf, tier)
-
-        # Simpan result untuk save feature
-        context.user_data['last_result'] = result
-        context.user_data['last_ticker'] = ticker
-        context.user_data['last_tf'] = tf_label.get(tf, tf)
-        context.user_data['last_count'] = count
-
-        # Hantar analisa dengan notis privasi
-        timestamp = datetime.now().strftime("%d/%m/%Y %H:%M")
-        await update.message.reply_text(
-            f"{result}\n\n"
-            "━━━━━━━━━━━━━━━━\n"
-            "⚠️ *NOTIS PENTING*\n"
-            f"• 1 token telah ditolak\n"
-            f"• Data analisa *TIDAK* tersimpan dalam sistem\n"
-            f"• Sila simpan analisa ini sekarang\n"
-            f"• Masa: {timestamp}",
-            reply_markup=kb_after_analisa(),
-            parse_mode='Markdown'
-        )
-
-        # DELETE data candle dari sistem
-        context.user_data['candles_collected'] = []
-        context.user_data['current_candle'] = 1
-
         return STATE_SAVE
     else:
         next_c = current + 1
@@ -598,17 +650,23 @@ async def handle_guided_candle(update: Update, context: ContextTypes.DEFAULT_TYP
 async def handle_csv_upload(update: Update, context: ContextTypes.DEFAULT_TYPE):
     user_id = update.effective_user.id
     count = context.user_data.get('candle_count', 5)
-    tf = context.user_data.get('timeframe','D')
+    tf = context.user_data.get('timeframe', 'D')
     tier = context.user_data.get('tier', 0)
-    ticker = context.user_data.get('ticker','SAHAM')
-    tf_label = {"D":"Daily","W":"Weekly","M":"Monthly","Y":"Yearly"}
+    ticker = context.user_data.get('ticker', 'SAHAM')
 
     if not update.message.document:
         await update.message.reply_text("❗ Hantar file CSV je.")
         return STATE_WAITING_CSV
 
+    if (update.message.document.file_size or 0) > MAX_CSV_SIZE_BYTES:
+        await update.message.reply_text("❗ Fail CSV terlalu besar. Maksimum 1MB sahaja.")
+        return STATE_WAITING_CSV
+
     file = await update.message.document.get_file()
     file_bytes = await file.download_as_bytearray()
+    if len(file_bytes) > MAX_CSV_SIZE_BYTES:
+        await update.message.reply_text("❗ Fail CSV terlalu besar. Maksimum 1MB sahaja.")
+        return STATE_WAITING_CSV
     content = file_bytes.decode('utf-8', errors='ignore')
 
     try:
@@ -635,44 +693,32 @@ async def handle_csv_upload(update: Update, context: ContextTypes.DEFAULT_TYPE):
             return STATE_WAITING_CSV
         candles = []
         for row in rows:
-            o=float(str(row[col_map['open']]).replace(',',''))
-            h=float(str(row[col_map['high']]).replace(',',''))
-            l=float(str(row[col_map['low']]).replace(',',''))
-            c=float(str(row[col_map['close']]).replace(',',''))
-            v=float(str(row[col_map['volume']]).replace(',',''))
+            o, h, l, c, v = parse_candle_values([
+                row[col_map['open']],
+                row[col_map['high']],
+                row[col_map['low']],
+                row[col_map['close']],
+                row[col_map['volume']],
+            ])
             candles.append((o,h,l,c,v))
-    except Exception as e:
-        await update.message.reply_text(f"❗ Gagal baca CSV.\nError: {str(e)}")
+    except Exception:
+        logging.exception("CSV validation failed for user %s", user_id)
+        await update.message.reply_text(
+            "❗ Gagal baca CSV. Pastikan fail ada kolum open, high, low, close, volume dan data yang valid."
+        )
         return STATE_WAITING_CSV
 
-    await update.message.reply_text("⏳ Menganalisa data kau...")
-
-    # BARU tolak token sekarang
-    increment_usage(user_id)
-    log_pilot(user_id, tf, count, 'csv', tier)
-    result = analisa_engine(candles, ticker, tf, tier)
-
-    # Simpan result untuk save feature
-    context.user_data['last_result'] = result
-    context.user_data['last_ticker'] = ticker
-    context.user_data['last_tf'] = tf_label.get(tf, tf)
-    context.user_data['last_count'] = count
-
-    timestamp = datetime.now().strftime("%d/%m/%Y %H:%M")
-    await update.message.reply_text(
-        f"{result}\n\n"
-        "━━━━━━━━━━━━━━━━\n"
-        "⚠️ *NOTIS PENTING*\n"
-        f"• 1 token telah ditolak\n"
-        f"• Data analisa *TIDAK* tersimpan dalam sistem\n"
-        f"• Sila simpan analisa ini sekarang\n"
-        f"• Masa: {timestamp}",
-        reply_markup=kb_after_analisa(),
-        parse_mode='Markdown'
+    await send_analysis_result(
+        update.message,
+        context,
+        user_id,
+        candles,
+        ticker,
+        tf,
+        tier,
+        count,
+        'csv',
     )
-
-    # DELETE data candle
-    context.user_data['candles_collected'] = []
     return STATE_SAVE
 
 # ─────────────────────────────────────────
@@ -693,9 +739,9 @@ async def handle_save_forward(update: Update, context: ContextTypes.DEFAULT_TYPE
         return STATE_SAVE
 
     save_msg = (
-        f"📊 *ANALISA TERSIMPAN — {ticker}*\n"
-        f"Timeframe: {tf} | {count} Candle\n"
-        f"Masa: {timestamp}\n\n"
+        f"📊 *ANALISA TERSIMPAN — {md(ticker)}*\n"
+        f"Timeframe: {md(tf)} | {count} Candle\n"
+        f"Masa: {md(timestamp)}\n\n"
         f"{result}\n\n"
         "━━━━━━━━━━━━━━━━\n"
         "💾 Disimpan dari @sahammy2025_bot"
@@ -709,7 +755,8 @@ async def handle_save_forward(update: Update, context: ContextTypes.DEFAULT_TYPE
             parse_mode='Markdown'
         )
         await query.answer("✅ Analisa dah diforward ke Saved Messages kau!", show_alert=True)
-    except Exception as e:
+    except Exception:
+        logging.exception("Failed to forward saved analysis for user %s", query.from_user.id)
         await query.answer("❗ Gagal forward. Cuba download .txt.", show_alert=True)
 
     return STATE_SAVE
@@ -751,11 +798,12 @@ async def handle_save_txt(update: Update, context: ContextTypes.DEFAULT_TYPE):
             chat_id=query.from_user.id,
             document=file_obj,
             filename=filename,
-            caption=f"📄 Analisa *{ticker}* — {tf}\n_{timestamp}_",
+            caption=f"📄 Analisa *{md(ticker)}* — {md(tf)}\n_{md(timestamp)}_",
             parse_mode='Markdown'
         )
         await query.answer("✅ File .txt dah dihantar!", show_alert=True)
-    except Exception as e:
+    except Exception:
+        logging.exception("Failed to send txt analysis for user %s", query.from_user.id)
         await query.answer("❗ Gagal hantar file.", show_alert=True)
 
     return STATE_SAVE
